@@ -4,11 +4,17 @@ import platform
 import socket
 import sys
 import time
+import asyncio
 from datetime import timedelta
 from typing import Optional, Tuple
 
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
+
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 
 def _format_bytes(n: int) -> str:
@@ -21,13 +27,6 @@ def _format_bytes(n: int) -> str:
     return f"{size:.1f}{units[idx]}"
 
 
-@register(
-    "astrbot_plugin_serverinfo",
-    "Chinachani",
-    "查询服务器状态与当前启用插件",
-    "1.0.2",
-    "https://github.com/Chinachani/astrbot_plugin_serverinfo",
-)
 class ServerInfoPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -38,7 +37,7 @@ class ServerInfoPlugin(Star):
         sec = int(max(0, time.time() - self._started_at))
         return str(timedelta(seconds=sec))
 
-    def _server_info_text(self) -> str:
+    async def _server_info_text(self) -> str:
         lines = []
         lines.append("服务器信息：")
         lines.append(f"- 主机名：{socket.gethostname()}")
@@ -47,7 +46,7 @@ class ServerInfoPlugin(Star):
         lines.append(f"- 进程 PID：{os.getpid()}")
         lines.append(f"- 运行时长（本插件）：{self._uptime_text()}")
         lines.append(f"- CPU 核心数：{os.cpu_count() or 0}")
-        cpu_percent = self._get_cpu_percent()
+        cpu_percent = await self._get_cpu_percent()
         if cpu_percent is not None:
             lines.append(f"- CPU 占用：{cpu_percent:.1f}%")
         mem_used, mem_total = self._get_system_memory_bytes()
@@ -74,7 +73,12 @@ class ServerInfoPlugin(Star):
             pass
         return "\n".join(lines)
 
-    def _get_cpu_percent(self) -> Optional[float]:
+    async def _get_cpu_percent(self) -> Optional[float]:
+        if psutil is not None:
+            try:
+                return float(psutil.cpu_percent(interval=0.1))
+            except Exception:
+                pass
         # Linux fallback: read /proc/stat and compute delta with previous sample.
         def _read_cpu_stat() -> Optional[Tuple[int, int]]:
             with open("/proc/stat", "r", encoding="utf-8") as f:
@@ -93,7 +97,7 @@ class ServerInfoPlugin(Star):
                 return None
             if self._last_cpu_stat is None:
                 # 首次调用给一个即时值
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
                 next_stat = _read_cpu_stat()
                 if next_stat is None:
                     return None
@@ -114,6 +118,12 @@ class ServerInfoPlugin(Star):
             return None
 
     def _get_system_memory_bytes(self) -> Tuple[Optional[int], Optional[int]]:
+        if psutil is not None:
+            try:
+                vm = psutil.virtual_memory()
+                return int(vm.used), int(vm.total)
+            except Exception:
+                pass
         # Linux fallback: parse /proc/meminfo.
         try:
             mem_total_kb = None
@@ -133,6 +143,11 @@ class ServerInfoPlugin(Star):
             return None, None
 
     def _get_process_rss_bytes(self) -> Optional[int]:
+        if psutil is not None:
+            try:
+                return int(psutil.Process(os.getpid()).memory_info().rss)
+            except Exception:
+                pass
         # Linux fallback: parse /proc/self/status VmRSS.
         try:
             with open("/proc/self/status", "r", encoding="utf-8") as f:
@@ -162,47 +177,34 @@ class ServerInfoPlugin(Star):
         return "\n".join(lines)
 
     def _get_event_text(self, event: AstrMessageEvent) -> str:
-        for name in ("message_str", "plain_text", "raw_message", "message", "text"):
-            val = getattr(event, name, None)
-            if val is None:
-                continue
-            if callable(val):
-                try:
-                    val = val()
-                except Exception:
-                    continue
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-            for meth in ("get_plain_text", "to_plain_text"):
-                func = getattr(val, meth, None)
-                if callable(func):
-                    try:
-                        text = func()
-                    except Exception:
-                        text = ""
-                    if isinstance(text, str) and text.strip():
-                        return text.strip()
-        return ""
+        text = getattr(event, "message_str", "") or ""
+        if isinstance(text, str):
+            return text.strip()
+        try:
+            msg = event.get_message_str()
+            return str(msg or "").strip()
+        except Exception:
+            return ""
 
     @filter.command("serverinfo")
     async def serverinfo(self, event: AstrMessageEvent, args: str = ""):
         """查看服务器信息与插件状态。"""
         sub = (args or "").strip().lower()
         if sub in {"", "info", "server", "服务器"}:
-            yield event.plain_result(self._server_info_text())
+            yield event.plain_result(await self._server_info_text())
             return
         if sub in {"plugins", "plugin", "pl", "插件"}:
             yield event.plain_result(self._plugins_info_text())
             return
         if sub in {"all", "full"}:
-            yield event.plain_result(self._server_info_text() + "\n\n" + self._plugins_info_text())
+            yield event.plain_result((await self._server_info_text()) + "\n\n" + self._plugins_info_text())
             return
         yield event.plain_result("用法：/serverinfo [info|plugins|all]")
 
     @filter.command("服务器信息")
     async def serverinfo_cn(self, event: AstrMessageEvent):
         """中文快捷命令：查看服务器信息。"""
-        yield event.plain_result(self._server_info_text())
+        yield event.plain_result(await self._server_info_text())
 
     @filter.command("插件状态")
     async def plugins_cn(self, event: AstrMessageEvent):
@@ -215,11 +217,10 @@ class ServerInfoPlugin(Star):
         text = self._get_event_text(event)
         if not text:
             return
-        text = text.strip()
         if text.startswith("/"):
             text = text[1:].strip()
         if text == "服务器信息":
-            yield event.plain_result(self._server_info_text())
+            yield event.plain_result(await self._server_info_text())
             return
         if text == "插件状态":
             yield event.plain_result(self._plugins_info_text())

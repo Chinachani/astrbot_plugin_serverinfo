@@ -1,6 +1,6 @@
 name: astrbot_plugin_serverinfo
 desc: 查询服务器信息与当前启用插件
 help: /serverinfo
-version: v1.0.2
+version: v1.0.3
 author: Chinachani
 repo: https://github.com/Chinachani/astrbot_plugin_serverinfo
